@@ -11,3 +11,7 @@ type UnrollRes struct {
 }
 
 var ErrWaitingForConfirmation = fmt.Errorf("waiting for confirmation(s), please retry later")
+
+// ErrInsufficientOnchainFunds is returned when the bump address can't pay the CPFP child of an
+// unroll package. Unrolling can't go on without it, so retrying is useless until it's funded.
+var ErrInsufficientOnchainFunds = fmt.Errorf("insufficient onchain funds to pay unroll fees")
