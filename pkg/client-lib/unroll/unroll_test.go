@@ -1,6 +1,7 @@
 package unroll
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -28,7 +29,7 @@ func TestUnroll(t *testing.T) {
 			{name: "shared branch", vtxoBranches: []int{0, 0, 1}, expectedPackages: 2},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				args, explorer := newTestUnrollArgs(t, tc.vtxoBranches)
+				args, explorer := newTestUnrollArgs(t, tc.vtxoBranches, false)
 
 				res, err := Unroll(t.Context(), args)
 				require.NoError(t, err)
@@ -59,7 +60,7 @@ func TestUnroll(t *testing.T) {
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				args, explorer := newTestUnrollArgs(t, tc.vtxoBranches)
+				args, explorer := newTestUnrollArgs(t, tc.vtxoBranches, false)
 				explorer.failBroadcastAt = tc.failBroadcastAt
 
 				res, err := Unroll(t.Context(), args)
@@ -71,18 +72,80 @@ func TestUnroll(t *testing.T) {
 	})
 }
 
-// unrollStubExplorer reports every tx as offchain. Broadcast records the
-// packages it accepts and fails the failBroadcastAt-th call (1-based, 0 never
-// fails).
+func TestBumpUnroll(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		for _, tc := range []struct {
+			name          string
+			vtxoBranches  []int
+			inMempool     bool
+			expectedBumps int
+		}{
+			{name: "nothing pending", vtxoBranches: []int{0, 1}, expectedBumps: 0},
+			{
+				name:          "pending branches",
+				vtxoBranches:  []int{0, 1},
+				inMempool:     true,
+				expectedBumps: 2,
+			},
+			{
+				name:          "shared pending branch",
+				vtxoBranches:  []int{0, 0, 1},
+				inMempool:     true,
+				expectedBumps: 2,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				args, explorer := newTestUnrollArgs(t, tc.vtxoBranches, tc.inMempool)
+
+				res, err := BumpUnroll(t.Context(), args)
+				require.NoError(t, err)
+				require.Len(t, res, tc.expectedBumps)
+				requireBroadcastPackages(t, explorer, res)
+
+				for _, pkg := range res {
+					require.Equal(t, explorer.mempool[pkg.ParentTxid], pkg.ParentTx)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		t.Run("later broadcast fails", func(t *testing.T) {
+			args, explorer := newTestUnrollArgs(t, []int{0, 1}, true)
+			explorer.failBroadcastAt = 2
+
+			res, err := BumpUnroll(t.Context(), args)
+			require.ErrorIs(t, err, errTestBroadcast)
+			require.Len(t, res, 1)
+			requireBroadcastPackages(t, explorer, res)
+		})
+	})
+}
+
+// unrollStubExplorer reports the txs in mempool as unconfirmed and any other as
+// offchain. Broadcast records the packages it accepts and fails the
+// failBroadcastAt-th call (1-based, 0 never fails).
 type unrollStubExplorer struct {
 	clientlib.Explorer
+	mempool         map[string]string
 	failBroadcastAt int
 	broadcasts      int
 	packages        [][]string
 }
 
 func (e *unrollStubExplorer) GetTxBlockTime(txid string) (bool, int64, error) {
-	return false, 0, fmt.Errorf("tx %s not found", txid)
+	if _, ok := e.mempool[txid]; !ok {
+		return false, 0, fmt.Errorf("tx %s not found", txid)
+	}
+	return false, 0, nil
+}
+
+func (e *unrollStubExplorer) GetTxHex(txid string) (string, error) {
+	tx, ok := e.mempool[txid]
+	if !ok {
+		return "", fmt.Errorf("tx %s not found", txid)
+	}
+	return tx, nil
 }
 
 func (e *unrollStubExplorer) Broadcast(txs ...string) (string, error) {
@@ -118,16 +181,20 @@ func (i stubIndexer) GetVirtualTxs(
 }
 
 // newTestUnrollArgs returns args unrolling one vtxo per entry of vtxoBranches,
-// each entry being the index of the offchain branch tx the vtxo hangs from. It
-// also returns the explorer, to inspect the broadcasts.
+// each entry being the index of the branch tx the vtxo hangs from. The branch
+// txs are offchain, or in the mempool if inMempool is set. It also returns the
+// explorer, to inspect the broadcasts.
 func newTestUnrollArgs(
-	t *testing.T, vtxoBranches []int,
+	t *testing.T, vtxoBranches []int, inMempool bool,
 ) (UnrollArgs, *unrollStubExplorer) {
 	t.Helper()
 
 	args, _ := newTestBumpAnchorArgs(t, []uint64{100_000}, 1)
 
-	explorer := &unrollStubExplorer{Explorer: args.Explorer}
+	explorer := &unrollStubExplorer{
+		Explorer: args.Explorer,
+		mempool:  make(map[string]string),
+	}
 	indexer := stubIndexer{
 		chains:     make(map[string][]clientlib.ChainWithExpiry),
 		virtualTxs: make(map[string]string),
@@ -138,6 +205,9 @@ func newTestUnrollArgs(
 		for len(parents) <= branch {
 			parent, ptx := newTestBranchTx(t, len(parents))
 			indexer.virtualTxs[parent.TxID()] = ptx
+			if inMempool {
+				explorer.mempool[parent.TxID()] = serializeTx(t, parent)
+			}
 			parents = append(parents, parent)
 		}
 
@@ -221,4 +291,12 @@ func testHash(t *testing.T, n int) chainhash.Hash {
 	hash, err := chainhash.NewHashFromStr(fmt.Sprintf("%064x", n+1))
 	require.NoError(t, err)
 	return *hash
+}
+
+func serializeTx(t *testing.T, tx *wire.MsgTx) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	require.NoError(t, tx.Serialize(&buf))
+	return hex.EncodeToString(buf.Bytes())
 }

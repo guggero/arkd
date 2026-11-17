@@ -121,32 +121,92 @@ func Unroll(ctx context.Context, args UnrollArgs) ([]UnrollRes, error) {
 
 	res := make([]UnrollRes, 0, len(transactions))
 	for _, parent := range transactions {
-		var parentTx wire.MsgTx
-		if err := parentTx.Deserialize(hex.NewDecoder(strings.NewReader(parent))); err != nil {
-			return res, err
-		}
-
-		childTxid, child, err := bumpAnchorTx(ctx, args, &parentTx)
+		pkg, err := broadcastPackage(ctx, args, parent)
 		if err != nil {
 			return res, err
 		}
-
-		// broadcast the package (parent + child)
-		packageResponse, err := args.Explorer.Broadcast(parent, child)
-		if err != nil {
-			return res, err
-		}
-
-		res = append(res, UnrollRes{
-			ParentTx:   parent,
-			ParentTxid: parentTx.TxID(),
-			ChildTx:    child,
-			ChildTxid:  childTxid,
-		})
-		log.Debugf("package broadcasted: %s", packageResponse)
+		res = append(res, *pkg)
 	}
 
 	return res, nil
+}
+
+// BumpUnroll rebuilds, at the current feerate, the CPFP child of every branch tx still in the
+// mempool and rebroadcasts its package. Unroll never revisits a branch tx once broadcast, so if
+// the feerate rises the package can stay unconfirmed until the batch expires and the server can
+// sweep it. The new child spends the same anchor and pays more, so it replaces the old one:
+// TRUC/P2A relay policy allows one replacement child per unconfirmed parent.
+//
+// It returns the rebroadcast packages, none if nothing is pending. Every call pays more than the
+// last, so callers should drive it from a stall threshold rather than a timer.
+func BumpUnroll(ctx context.Context, args UnrollArgs) ([]UnrollRes, error) {
+	if err := args.validate(); err != nil {
+		return nil, fmt.Errorf("invalid args: %w", err)
+	}
+
+	branches, err := getBranchesToUnroll(ctx, args.Explorer, args.Indexer, args.Vtxos)
+	if err != nil {
+		return nil, err
+	}
+
+	// Several vtxos can share a branch tx, and bumping it twice would only replace the first bump.
+	pendingTxids := make([]string, 0, len(branches))
+	seen := make(map[string]struct{}, len(branches))
+	for _, branch := range branches {
+		_, err := branch.NextRedeemTx()
+		pending, ok := err.(ErrPendingConfirmation)
+		if !ok {
+			continue
+		}
+		if _, ok := seen[pending.Txid]; ok {
+			continue
+		}
+		seen[pending.Txid] = struct{}{}
+		pendingTxids = append(pendingTxids, pending.Txid)
+	}
+
+	res := make([]UnrollRes, 0, len(pendingTxids))
+	for _, txid := range pendingTxids {
+		parent, err := args.Explorer.GetTxHex(txid)
+		if err != nil {
+			return res, fmt.Errorf("failed to fetch pending tx %s: %w", txid, err)
+		}
+
+		// Package relay accepts the parent as a duplicate since it's already in the mempool.
+		pkg, err := broadcastPackage(ctx, args, parent)
+		if err != nil {
+			return res, err
+		}
+		res = append(res, *pkg)
+	}
+
+	return res, nil
+}
+
+// broadcastPackage builds the child bumping the given parent tx and broadcasts them together.
+func broadcastPackage(ctx context.Context, args UnrollArgs, parent string) (*UnrollRes, error) {
+	var parentTx wire.MsgTx
+	if err := parentTx.Deserialize(hex.NewDecoder(strings.NewReader(parent))); err != nil {
+		return nil, err
+	}
+
+	childTxid, child, err := bumpAnchorTx(ctx, args, &parentTx)
+	if err != nil {
+		return nil, err
+	}
+
+	packageResponse, err := args.Explorer.Broadcast(parent, child)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("package broadcasted: %s", packageResponse)
+
+	return &UnrollRes{
+		ParentTx:   parent,
+		ParentTxid: parentTx.TxID(),
+		ChildTx:    child,
+		ChildTxid:  childTxid,
+	}, nil
 }
 
 // bumpAnchorTx builds and signs a transaction bumping the fees for a given tx with P2A output.
