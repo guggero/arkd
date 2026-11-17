@@ -15,6 +15,12 @@ func (w *wallet) SendOffChain(
 		return nil, err
 	}
 
+	// Hold the lock while reading the VTXOs this spends: a batch (Settle)
+	// holding it may be spending the same ones, and a set read before it
+	// releases is stale by the time this submits (VTXO_ALREADY_SPENT).
+	w.txLock.Lock()
+	defer w.txLock.Unlock()
+
 	vtxos, err := w.getSpendableVtxos(ctx, &getVtxosFilter{excludeRecoverableVtxos: true})
 	if err != nil {
 		return nil, err
@@ -28,9 +34,6 @@ func (w *wallet) SendOffChain(
 	signTx := func(ctx context.Context, tx string) (string, error) {
 		return w.identity.SignTransaction(ctx, tx, nil)
 	}
-
-	w.txLock.Lock()
-	defer w.txLock.Unlock()
 
 	return offchaintx.Send(ctx, offchaintx.SendArgs{
 		Client:       w.client,
