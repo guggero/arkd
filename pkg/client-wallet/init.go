@@ -12,7 +12,7 @@ import (
 
 func (w *wallet) Init(ctx context.Context, args InitArgs) error {
 	if err := args.validate(); err != nil {
-		return fmt.Errorf("invalid args: %s", err)
+		return fmt.Errorf("invalid args: %w", err)
 	}
 	if w.identity == nil {
 		return ErrNotInitialized
@@ -26,17 +26,17 @@ func (w *wallet) init(
 ) error {
 	clientSvc, err := client.NewClient(args.serverUrl, w.clientVersion)
 	if err != nil {
-		return fmt.Errorf("failed to setup client: %s", err)
+		return fmt.Errorf("failed to setup client: %w", err)
 	}
 
 	info, err := clientSvc.GetInfo(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to connect to server: %s", err)
+		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 
 	indexerSvc, err := indexer.NewClient(args.serverUrl)
 	if err != nil {
-		return fmt.Errorf("failed to setup indexer: %s", err)
+		return fmt.Errorf("failed to setup indexer: %w", err)
 	}
 
 	if explorerSvc == nil {
@@ -47,7 +47,7 @@ func (w *wallet) init(
 			args.explorerURL, clientlib.NetworkFromString(info.Network), explorerOpts...,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to setup explorer: %s", err)
+			return fmt.Errorf("failed to setup explorer: %w", err)
 		}
 	}
 
